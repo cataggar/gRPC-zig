@@ -22,8 +22,10 @@ pub const GrpcServer = struct {
     health_check: health.HealthCheck,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, secret_key: []const u8) !GrpcServer {
-        // Listen on IPv6 any (dual-stack: accepts both IPv4 and IPv6 on most OS)
-        const address = try std.net.Address.parseIp6("::", port);
+        // Try IPv6 first (Go gRPC on Windows resolves localhost to [::1])
+        // Fall back to IPv4 if IPv6 not available
+        const address = std.net.Address.parseIp6("::1", port) catch
+            try std.net.Address.parseIp("127.0.0.1", port);
         const server = try address.listen(.{ .reuse_address = true });
         return GrpcServer{
             .allocator = allocator,
