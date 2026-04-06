@@ -38,6 +38,28 @@ pub const Transport = struct {
         return self.stream.read(buf);
     }
 
+    /// Write to socket — uses send() on Windows to avoid WriteFile issues
+    fn socketWrite(self: *Transport, buf: []const u8) !usize {
+        if (comptime builtin.os.tag == .windows) {
+            const rc = std.os.windows.ws2_32.send(
+                @ptrCast(self.stream.handle),
+                buf.ptr,
+                @intCast(buf.len),
+                0,
+            );
+            if (rc == std.os.windows.ws2_32.SOCKET_ERROR) return error.ConnectionClosed;
+            return @intCast(rc);
+        }
+        return self.stream.write(buf);
+    }
+
+    fn socketWriteAll(self: *Transport, buf: []const u8) !void {
+        var sent: usize = 0;
+        while (sent < buf.len) {
+            sent += try self.socketWrite(buf[sent..]);
+        }
+    }
+
     pub fn initClient(allocator: std.mem.Allocator, stream: net.Stream) !Transport {
         var transport = Transport{
             .stream = stream,
@@ -81,7 +103,7 @@ pub const Transport = struct {
 
     fn setupHttp2Client(self: *Transport) !void {
         // Client sends HTTP/2 connection preface
-        _ = try self.stream.write(http2.connection.Connection.PREFACE);
+        try self.socketWriteAll(http2.connection.Connection.PREFACE);
 
         // Send initial SETTINGS frame
         const settings_header: [9]u8 = .{
@@ -90,7 +112,7 @@ pub const Transport = struct {
             0, // flags: none
             0, 0, 0, 0, // stream_id: 0
         };
-        _ = try self.stream.write(&settings_header);
+        try self.socketWriteAll(&settings_header);
     }
 
     fn setupHttp2Server(self: *Transport) !void {
@@ -111,7 +133,7 @@ pub const Transport = struct {
             0, 0, 0, @intFromEnum(http2.frame.FrameType.SETTINGS), 0, 0, 0, 0, 0,
             0, 0, 0, @intFromEnum(http2.frame.FrameType.SETTINGS), 0x1, 0, 0, 0, 0,
         };
-        _ = try self.stream.write(&response);
+        try self.socketWriteAll(&response);
     }
 
     pub fn readMessage(self: *Transport) ![]const u8 {
@@ -192,7 +214,7 @@ pub const Transport = struct {
                     pong[7] = 0;
                     pong[8] = 0;
                     if (length == 8) @memcpy(pong[9..17], payload[0..8]);
-                    _ = self.stream.write(&pong) catch {};
+                    self.socketWriteAll(&pong) catch {};
                     self.allocator.free(payload);
                     continue;
                 },
@@ -222,37 +244,73 @@ pub const Transport = struct {
     }
 
     pub fn writeMessage(self: *Transport, message: []const u8) !void {
-        // Send HEADERS frame first (required for gRPC response)
-        const headers_frame: [9]u8 = .{
-            0, 0, 0, // length: 0 (minimal headers)
-            @intFromEnum(http2.frame.FrameType.HEADERS),
-            http2.frame.FrameFlags.END_HEADERS, // END_HEADERS
-            0, 0, 0, 1, // stream_id: 1
-        };
-        _ = try self.stream.write(&headers_frame);
+        // HPACK-encoded response headers for gRPC:
+        // :status: 200 → static table index 8 (0x88)
+        // content-type: application/grpc → literal with name index 31, value "application/grpc"
+        const grpc_content_type = "application/grpc";
+        const hpack_headers = [_]u8{
+            0x88, // :status: 200 (indexed, static table entry 8)
+            0x40 | 31, // literal header with incremental indexing, name index 31 (content-type)
+            @intCast(grpc_content_type.len), // value length
+        } ++ grpc_content_type.*;
+        const hpack_len = hpack_headers.len;
 
-        // Send DATA frame
-        const frame_type = http2.frame.FrameType.DATA;
-        const frame_flags = http2.frame.FrameFlags.END_STREAM;
-        const stream_id: u31 = 1; // Use appropriate stream ID
-        const length: u24 = @intCast(message.len);
+        // HEADERS frame with gRPC response headers
+        var headers_frame: [9 + hpack_len]u8 = undefined;
+        headers_frame[0] = @intCast((hpack_len >> 16) & 0xFF);
+        headers_frame[1] = @intCast((hpack_len >> 8) & 0xFF);
+        headers_frame[2] = @intCast(hpack_len & 0xFF);
+        headers_frame[3] = @intFromEnum(http2.frame.FrameType.HEADERS);
+        headers_frame[4] = http2.frame.FrameFlags.END_HEADERS;
+        headers_frame[5] = 0;
+        headers_frame[6] = 0;
+        headers_frame[7] = 0;
+        headers_frame[8] = 1; // stream_id: 1
+        @memcpy(headers_frame[9..], &hpack_headers);
+        try self.socketWriteAll(&headers_frame);
 
-        // Write frame header
-        var header: [9]u8 = undefined;
-        header[0] = @intCast((length >> 16) & 0xFF);
-        header[1] = @intCast((length >> 8) & 0xFF);
-        header[2] = @intCast(length & 0xFF);
-        header[3] = @intFromEnum(frame_type);
-        header[4] = frame_flags;
-        header[5] = @intCast((stream_id >> 24) & 0xFF);
-        header[6] = @intCast((stream_id >> 16) & 0xFF);
-        header[7] = @intCast((stream_id >> 8) & 0xFF);
-        header[8] = @intCast(stream_id & 0xFF);
-
-        _ = try self.stream.write(&header);
+        // DATA frame with gRPC response body
+        const data_len: u24 = @intCast(message.len);
+        var data_header: [9]u8 = undefined;
+        data_header[0] = @intCast((data_len >> 16) & 0xFF);
+        data_header[1] = @intCast((data_len >> 8) & 0xFF);
+        data_header[2] = @intCast(data_len & 0xFF);
+        data_header[3] = @intFromEnum(http2.frame.FrameType.DATA);
+        data_header[4] = 0; // no flags yet
+        data_header[5] = 0;
+        data_header[6] = 0;
+        data_header[7] = 0;
+        data_header[8] = 1; // stream_id: 1
+        try self.socketWriteAll(&data_header);
         if (message.len > 0) {
-            _ = try self.stream.write(message);
+            try self.socketWriteAll(message);
         }
+
+        // Trailing HEADERS frame with grpc-status: 0 (OK)
+        // grpc-status is not in HPACK static table, use literal
+        const grpc_status_header = "grpc-status";
+        const grpc_status_value = "0";
+        const trailer = [_]u8{
+            0x00, // literal header, not indexed, new name
+            @intCast(grpc_status_header.len),
+        } ++ grpc_status_header.* ++ [_]u8{
+            @intCast(grpc_status_value.len),
+        } ++ grpc_status_value.*;
+        const trailer_len = trailer.len;
+
+        var trailer_frame: [9 + trailer_len]u8 = undefined;
+        trailer_frame[0] = @intCast((trailer_len >> 16) & 0xFF);
+        trailer_frame[1] = @intCast((trailer_len >> 8) & 0xFF);
+        trailer_frame[2] = @intCast(trailer_len & 0xFF);
+        trailer_frame[3] = @intFromEnum(http2.frame.FrameType.HEADERS);
+        trailer_frame[4] = http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS;
+        trailer_frame[5] = 0;
+        trailer_frame[6] = 0;
+        trailer_frame[7] = 0;
+        trailer_frame[8] = 1; // stream_id: 1
+        @memcpy(trailer_frame[9..], &trailer);
+        try self.socketWriteAll(&trailer_frame);
     }
 };
+
 
