@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = std.net;
+const builtin = @import("builtin");
 const http2 = struct {
     pub const connection = @import("http2/connection.zig");
     pub const frame = @import("http2/frame.zig");
@@ -20,6 +21,22 @@ pub const Transport = struct {
     write_buf: []u8,
     allocator: std.mem.Allocator,
     http2_conn: ?http2.connection.Connection,
+
+    /// Read from socket — uses recv() on Windows to avoid ReadFile ERROR_INVALID_PARAMETER
+    fn socketRead(self: *Transport, buf: []u8) !usize {
+        if (comptime builtin.os.tag == .windows) {
+            const rc = std.os.windows.ws2_32.recv(
+                @ptrCast(self.stream.handle),
+                buf.ptr,
+                @intCast(buf.len),
+                0,
+            );
+            if (rc == std.os.windows.ws2_32.SOCKET_ERROR) return error.ConnectionClosed;
+            if (rc == 0) return error.ConnectionClosed;
+            return @intCast(rc);
+        }
+        return self.stream.read(buf);
+    }
 
     pub fn initClient(allocator: std.mem.Allocator, stream: net.Stream) !Transport {
         var transport = Transport{
@@ -77,86 +94,49 @@ pub const Transport = struct {
     }
 
     fn setupHttp2Server(self: *Transport) !void {
-        // Server receives and validates HTTP/2 connection preface (24 bytes)
-        var preface_buf: [24]u8 = undefined;
-        var preface_read: usize = 0;
-        while (preface_read < 24) {
-            const n = self.stream.read(preface_buf[preface_read..]) catch return TransportError.ConnectionClosed;
-            if (n == 0) return TransportError.ConnectionClosed;
-            preface_read += n;
+        // Read client preface using socketRead (recv on Windows)
+        var total: usize = 0;
+        while (total < 24) {
+            const n = self.socketRead(self.read_buf[total..4096]) catch return TransportError.ConnectionClosed;
+            total += n;
         }
 
-        // Validate preface
-        if (!std.mem.eql(u8, &preface_buf, http2.connection.Connection.PREFACE)) {
+        // Validate HTTP/2 connection preface (first 24 bytes)
+        if (!std.mem.eql(u8, self.read_buf[0..24], http2.connection.Connection.PREFACE)) {
             return TransportError.Http2Error;
         }
 
-        // Read client's SETTINGS frame header (9 bytes)
-        var settings_header: [9]u8 = undefined;
-        var settings_read: usize = 0;
-        while (settings_read < 9) {
-            const n = self.stream.read(settings_header[settings_read..]) catch return TransportError.ConnectionClosed;
-            if (n == 0) return TransportError.ConnectionClosed;
-            settings_read += n;
-        }
-
-        // Skip settings payload if any
-        const settings_length: usize = (@as(usize, settings_header[0]) << 16) |
-            (@as(usize, settings_header[1]) << 8) |
-            @as(usize, settings_header[2]);
-        if (settings_length > 0) {
-            const settings_payload = try self.allocator.alloc(u8, settings_length);
-            defer self.allocator.free(settings_payload);
-            var sp_read: usize = 0;
-            while (sp_read < settings_length) {
-                const n = self.stream.read(settings_payload[sp_read..]) catch return TransportError.ConnectionClosed;
-                if (n == 0) return TransportError.ConnectionClosed;
-                sp_read += n;
-            }
-        }
-
-        // Send server's SETTINGS frame
-        const settings_response: [9]u8 = .{
-            0, 0, 0,
-            @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0, // no flags
-            0, 0, 0, 0,
+        // Send server SETTINGS + SETTINGS ACK immediately
+        const response = [_]u8{
+            0, 0, 0, @intFromEnum(http2.frame.FrameType.SETTINGS), 0, 0, 0, 0, 0,
+            0, 0, 0, @intFromEnum(http2.frame.FrameType.SETTINGS), 0x1, 0, 0, 0, 0,
         };
-        _ = try self.stream.write(&settings_response);
-
-        // Send SETTINGS ACK for client's settings
-        const settings_ack: [9]u8 = .{
-            0, 0, 0,
-            @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0x1, // ACK flag
-            0, 0, 0, 0,
-        };
-        _ = try self.stream.write(&settings_ack);
+        _ = try self.stream.write(&response);
     }
 
     pub fn readMessage(self: *Transport) ![]const u8 {
         while (true) {
-            // Read frame header (9 bytes)
-            var header: [9]u8 = undefined;
+            // Read frame header (9 bytes) into heap-allocated read_buf
+            // (avoids Windows ReadFile ERROR_INVALID_PARAMETER with stack buffers)
             var header_read: usize = 0;
             while (header_read < 9) {
-                const n = self.stream.read(header[header_read..]) catch return TransportError.ConnectionClosed;
+                const n = self.socketRead(self.read_buf[header_read..9]) catch return TransportError.ConnectionClosed;
                 if (n == 0) return TransportError.ConnectionClosed;
                 header_read += n;
             }
 
-            const length: u24 = (@as(u24, header[0]) << 16) | (@as(u24, header[1]) << 8) | @as(u24, header[2]);
-            const frame_type = header[3];
-            const flags = header[4];
-            const stream_id: u32 = (@as(u32, header[5] & 0x7F) << 24) | (@as(u32, header[6]) << 16) |
-                (@as(u32, header[7]) << 8) | @as(u32, header[8]);
+            const length: u24 = (@as(u24, self.read_buf[0]) << 16) | (@as(u24, self.read_buf[1]) << 8) | @as(u24, self.read_buf[2]);
+            const frame_type = self.read_buf[3];
+            const flags = self.read_buf[4];
 
-            // Read payload
+            // Read payload into heap-allocated buffer
             const payload = try self.allocator.alloc(u8, length);
             if (length > 0) {
                 var total_read: usize = 0;
                 while (total_read < length) {
-                    const n = self.stream.read(payload[total_read..]) catch {
+                    const remaining = length - total_read;
+                    const chunk = @min(remaining, self.read_buf.len);
+                    const n = self.socketRead(self.read_buf[0..chunk]) catch {
                         self.allocator.free(payload);
                         return TransportError.ConnectionClosed;
                     };
@@ -164,6 +144,7 @@ pub const Transport = struct {
                         self.allocator.free(payload);
                         return TransportError.ConnectionClosed;
                     }
+                    @memcpy(payload[total_read .. total_read + n], self.read_buf[0..n]);
                     total_read += n;
                 }
             }
@@ -174,11 +155,8 @@ pub const Transport = struct {
                     return payload;
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
-                    // HEADERS frame — extract path from HPACK-encoded headers
-                    // For gRPC, this contains :method, :path, content-type etc.
-                    // Store stream_id for response routing
+                    // HEADERS frame — skip (gRPC routing not yet implemented)
                     self.allocator.free(payload);
-                    _ = stream_id;
                     // Continue to read the DATA frame that follows
                     continue;
                 },
@@ -277,3 +255,4 @@ pub const Transport = struct {
         }
     }
 };
+
