@@ -123,36 +123,125 @@ pub const Transport = struct {
     }
 
     pub fn readMessage(self: *Transport) ![]const u8 {
-        // Read frame header first (9 bytes)
-        const header_size = 9;
-        var header: [header_size]u8 = undefined;
-        const bytes_read = try self.stream.read(&header);
-        if (bytes_read < header_size) return TransportError.ConnectionClosed;
+        while (true) {
+            // Read frame header (9 bytes)
+            var header: [9]u8 = undefined;
+            var header_read: usize = 0;
+            while (header_read < 9) {
+                const n = self.stream.read(header[header_read..]) catch return TransportError.ConnectionClosed;
+                if (n == 0) return TransportError.ConnectionClosed;
+                header_read += n;
+            }
 
-        // Parse header manually
-        const length = (@as(u24, header[0]) << 16) | (@as(u24, header[1]) << 8) | @as(u24, header[2]);
-        const frame_type = header[3];
+            const length: u24 = (@as(u24, header[0]) << 16) | (@as(u24, header[1]) << 8) | @as(u24, header[2]);
+            const frame_type = header[3];
+            const flags = header[4];
+            const stream_id: u32 = (@as(u32, header[5] & 0x7F) << 24) | (@as(u32, header[6]) << 16) |
+                (@as(u32, header[7]) << 8) | @as(u32, header[8]);
 
-        // Read payload
-        const payload = try self.allocator.alloc(u8, length);
-        errdefer self.allocator.free(payload);
+            // Read payload
+            const payload = try self.allocator.alloc(u8, length);
+            if (length > 0) {
+                var total_read: usize = 0;
+                while (total_read < length) {
+                    const n = self.stream.read(payload[total_read..]) catch {
+                        self.allocator.free(payload);
+                        return TransportError.ConnectionClosed;
+                    };
+                    if (n == 0) {
+                        self.allocator.free(payload);
+                        return TransportError.ConnectionClosed;
+                    }
+                    total_read += n;
+                }
+            }
 
-        if (length > 0) {
-            const payload_read = try self.stream.read(payload);
-            if (payload_read < length) {
-                return TransportError.ConnectionClosed;
+            switch (frame_type) {
+                @intFromEnum(http2.frame.FrameType.DATA) => {
+                    // DATA frame — return payload to handler
+                    return payload;
+                },
+                @intFromEnum(http2.frame.FrameType.HEADERS) => {
+                    // HEADERS frame — extract path from HPACK-encoded headers
+                    // For gRPC, this contains :method, :path, content-type etc.
+                    // Store stream_id for response routing
+                    self.allocator.free(payload);
+                    _ = stream_id;
+                    // Continue to read the DATA frame that follows
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.SETTINGS) => {
+                    if (flags & 0x1 == 0) {
+                        // SETTINGS frame (not ACK) — send ACK back
+                        const settings_ack: [9]u8 = .{
+                            0, 0, 0,
+                            @intFromEnum(http2.frame.FrameType.SETTINGS),
+                            0x1, // ACK flag
+                            0, 0, 0, 0,
+                        };
+                        _ = self.stream.write(&settings_ack) catch {};
+                    }
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
+                    // WINDOW_UPDATE — acknowledge and continue
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.PING) => {
+                    // PING — send PONG (echo with ACK flag)
+                    var pong: [9 + 8]u8 = undefined;
+                    pong[0] = 0;
+                    pong[1] = 0;
+                    pong[2] = 8; // length = 8
+                    pong[3] = @intFromEnum(http2.frame.FrameType.PING);
+                    pong[4] = 0x1; // ACK flag
+                    pong[5] = 0;
+                    pong[6] = 0;
+                    pong[7] = 0;
+                    pong[8] = 0;
+                    if (length == 8) @memcpy(pong[9..17], payload[0..8]);
+                    _ = self.stream.write(&pong) catch {};
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.RST_STREAM) => {
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.GOAWAY) => {
+                    self.allocator.free(payload);
+                    return TransportError.ConnectionClosed;
+                },
+                @intFromEnum(http2.frame.FrameType.PRIORITY),
+                @intFromEnum(http2.frame.FrameType.PUSH_PROMISE),
+                @intFromEnum(http2.frame.FrameType.CONTINUATION),
+                => {
+                    // Skip unsupported frames
+                    self.allocator.free(payload);
+                    continue;
+                },
+                else => {
+                    // Unknown frame type — skip
+                    self.allocator.free(payload);
+                    continue;
+                },
             }
         }
-
-        // For DATA frames, return payload
-        if (frame_type == @intFromEnum(http2.frame.FrameType.DATA)) {
-            return payload;
-        }
-
-        return TransportError.Http2Error;
     }
 
     pub fn writeMessage(self: *Transport, message: []const u8) !void {
+        // Send HEADERS frame first (required for gRPC response)
+        const headers_frame: [9]u8 = .{
+            0, 0, 0, // length: 0 (minimal headers)
+            @intFromEnum(http2.frame.FrameType.HEADERS),
+            http2.frame.FrameFlags.END_HEADERS, // END_HEADERS
+            0, 0, 0, 1, // stream_id: 1
+        };
+        _ = try self.stream.write(&headers_frame);
+
+        // Send DATA frame
         const frame_type = http2.frame.FrameType.DATA;
         const frame_flags = http2.frame.FrameFlags.END_STREAM;
         const stream_id: u31 = 1; // Use appropriate stream ID
