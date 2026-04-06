@@ -7,57 +7,6 @@ pub fn build(b: *std.Build) void {
     const spice_dep = b.dependency("spice", .{});
     const spice_mod = spice_dep.module("spice");
 
-    // Build zlib from upstream source
-    const zlib_dep = b.dependency("zlib", .{});
-    const zlib_lib = b.addLibrary(.{
-        .name = "z",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-        }),
-        .linkage = .static,
-    });
-
-    // Add zlib C source files
-    const zlib_sources = [_][]const u8{
-        "adler32.c",
-        "compress.c",
-        "crc32.c",
-        "deflate.c",
-        "gzclose.c",
-        "gzlib.c",
-        "gzread.c",
-        "gzwrite.c",
-        "inflate.c",
-        "infback.c",
-        "inftrees.c",
-        "inffast.c",
-        "trees.c",
-        "uncompr.c",
-        "zutil.c",
-    };
-
-    for (zlib_sources) |src| {
-        const src_path = zlib_dep.path(src);
-        zlib_lib.addCSourceFile(.{
-            .file = src_path,
-            .flags = &[_][]const u8{
-                "-DHAVE_SYS_TYPES_H",
-                "-DHAVE_STDINT_H",
-                "-DHAVE_STDDEF_H",
-                "-DZ_HAVE_UNISTD_H",
-                "-fno-sanitize=undefined",
-            },
-        });
-    }
-
-    zlib_lib.linkLibC();
-    zlib_lib.installHeadersDirectory(
-        zlib_dep.path("."),
-        ".",
-        .{ .include_extensions = &[_][]const u8{ ".h" } },
-    );
-
     // Server module (for internal use and library export)
     const server_mod = b.addModule("grpc-server", .{
         .root_source_file = b.path("src/server.zig"),
@@ -84,7 +33,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "spice", .module = spice_mod }},
         }),
     });
-    benchmark.linkLibrary(zlib_lib);
+
     b.installArtifact(benchmark);
 
     // Benchmark step with automatic server management
@@ -125,7 +74,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    server_example.linkLibrary(zlib_lib);
+
     b.installArtifact(server_example);
 
     const client_example = b.addExecutable(.{
@@ -140,7 +89,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    client_example.linkLibrary(zlib_lib);
+
     b.installArtifact(client_example);
 
     // Tests
@@ -153,7 +102,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "spice", .module = spice_mod }},
         }),
     });
-    tests.linkLibrary(zlib_lib);
+
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
@@ -180,7 +129,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    integration_test_server.linkLibrary(zlib_lib);
+
 
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
     const integration_test_step = b.step("integration_test", "Build integration test server");
