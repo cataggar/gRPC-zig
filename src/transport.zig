@@ -77,47 +77,59 @@ pub const Transport = struct {
     }
 
     fn setupHttp2Server(self: *Transport) !void {
-        // Server receives and validates HTTP/2 connection preface
+        // Server receives and validates HTTP/2 connection preface (24 bytes)
         var preface_buf: [24]u8 = undefined;
-        const bytes_read = try self.stream.read(&preface_buf);
-        if (bytes_read < 24) return TransportError.ConnectionClosed;
+        var preface_read: usize = 0;
+        while (preface_read < 24) {
+            const n = self.stream.read(preface_buf[preface_read..]) catch return TransportError.ConnectionClosed;
+            if (n == 0) return TransportError.ConnectionClosed;
+            preface_read += n;
+        }
 
         // Validate preface
         if (!std.mem.eql(u8, &preface_buf, http2.connection.Connection.PREFACE)) {
             return TransportError.Http2Error;
         }
 
-        // Read client's SETTINGS frame
+        // Read client's SETTINGS frame header (9 bytes)
         var settings_header: [9]u8 = undefined;
-        const settings_read = try self.stream.read(&settings_header);
-        if (settings_read < 9) return TransportError.ConnectionClosed;
+        var settings_read: usize = 0;
+        while (settings_read < 9) {
+            const n = self.stream.read(settings_header[settings_read..]) catch return TransportError.ConnectionClosed;
+            if (n == 0) return TransportError.ConnectionClosed;
+            settings_read += n;
+        }
 
-        // TODO: Parse and process SETTINGS frame properly
-        // For now, just skip the payload if any
-        const settings_length = (@as(u24, settings_header[0]) << 16) |
-                                (@as(u24, settings_header[1]) << 8) |
-                                @as(u24, settings_header[2]);
+        // Skip settings payload if any
+        const settings_length: usize = (@as(usize, settings_header[0]) << 16) |
+            (@as(usize, settings_header[1]) << 8) |
+            @as(usize, settings_header[2]);
         if (settings_length > 0) {
             const settings_payload = try self.allocator.alloc(u8, settings_length);
             defer self.allocator.free(settings_payload);
-            _ = try self.stream.read(settings_payload);
+            var sp_read: usize = 0;
+            while (sp_read < settings_length) {
+                const n = self.stream.read(settings_payload[sp_read..]) catch return TransportError.ConnectionClosed;
+                if (n == 0) return TransportError.ConnectionClosed;
+                sp_read += n;
+            }
         }
 
         // Send server's SETTINGS frame
         const settings_response: [9]u8 = .{
-            0, 0, 0, // length: 0
+            0, 0, 0,
             @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0, // flags: none
-            0, 0, 0, 0, // stream_id: 0
+            0, // no flags
+            0, 0, 0, 0,
         };
         _ = try self.stream.write(&settings_response);
 
         // Send SETTINGS ACK for client's settings
         const settings_ack: [9]u8 = .{
-            0, 0, 0, // length: 0
+            0, 0, 0,
             @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0x1, // flags: ACK
-            0, 0, 0, 0, // stream_id: 0
+            0x1, // ACK flag
+            0, 0, 0, 0,
         };
         _ = try self.stream.write(&settings_ack);
     }
